@@ -22,14 +22,17 @@ jobs:
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service TermService -Force
 
-          $pass = -join ((48..57 + 65..90 + 97..122) | Get-Random -Count 14 | ForEach-Object {[char]$_})
+          # Strong password that always passes policy
+          $pass = "Rdp@" + (Get-Random -Minimum 10000000 -Maximum 99999999) + "xX!"
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+
           if (Get-LocalUser RDP -EA SilentlyContinue) { Remove-LocalUser RDP }
           New-LocalUser -Name RDP -Password $sec -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember Administrators RDP
           Add-LocalGroupMember "Remote Desktop Users" RDP
+
           "RDP_PASS=$pass" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "RDP user ready"
+          Write-Host "RDP user ready — password: $pass"
 
       - name: Install TightVNC
         run: |
