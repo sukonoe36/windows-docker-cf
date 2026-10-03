@@ -25,12 +25,10 @@ jobs:
 
           $pass = "Kx9@" + (Get-Random -Minimum 10000000 -Maximum 99999999) + "zQ!"
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
-
           if (Get-LocalUser RDP -EA SilentlyContinue) { Remove-LocalUser RDP }
           New-LocalUser -Name RDP -Password $sec -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember Administrators RDP
           Add-LocalGroupMember "Remote Desktop Users" RDP
-
           "RDP_PASS=$pass" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "RDP user ready — password: $pass"
 
@@ -40,11 +38,9 @@ jobs:
           $msi = Join-Path $env:TEMP "tightvnc.msi"
           Invoke-WebRequest "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi" -OutFile $msi
           Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msi`" /qn /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=vncpass"
-
           if (-not (Test-Path "C:\Program Files\TightVNC\tvnserver.exe")) {
             throw "TightVNC installation failed"
           }
-
           & "C:\Program Files\TightVNC\tvnserver.exe" -start
           Start-Sleep 3
           Write-Host "TightVNC installed and started"
@@ -56,7 +52,6 @@ jobs:
           if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
           Set-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $regPath -Name "LoopbackOnly" -Value 0 -Type DWord -Force
-
           & "C:\Program Files\TightVNC\tvnserver.exe" -stop
           Start-Sleep 2
           & "C:\Program Files\TightVNC\tvnserver.exe" -start
@@ -85,23 +80,29 @@ jobs:
           $exe = Join-Path $env:RUNNER_TEMP "cloudflared.exe"
           Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $exe
           & $exe --version
+          "CF_EXE=$exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Start Cloudflare tunnel
+      - name: Start + maintain Cloudflare tunnel (never drops)
         shell: pwsh
         run: |
-          $exe = Join-Path $env:RUNNER_TEMP "cloudflared.exe"
+          $exe = $env:CF_EXE
           $out = Join-Path $env:RUNNER_TEMP "cf.out"
           $err = Join-Path $env:RUNNER_TEMP "cf.err"
 
-          Remove-Item $out, $err -ErrorAction SilentlyContinue
+          function Start-Tunnel {
+            Remove-Item $out, $err -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $exe `
+              -ArgumentList "tunnel --no-autoupdate --protocol http2 --url http://localhost:6080" `
+              -RedirectStandardOutput $out `
+              -RedirectStandardError $err `
+              -PassThru -NoNewWindow
+            return $p
+          }
 
-          $proc = Start-Process -FilePath $exe `
-            -ArgumentList "tunnel --no-autoupdate --protocol http2 --url http://localhost:6080" `
-            -RedirectStandardOutput $out `
-            -RedirectStandardError $err `
-            -PassThru -NoNewWindow
-
+          $proc = Start-Tunnel
           $url = $null
+
+          # Wait for the first URL
           for ($i = 1; $i -le 60; $i++) {
             Start-Sleep 2
             $log = (Get-Content $out, $err -Raw -ErrorAction SilentlyContinue) -join "`n"
@@ -109,6 +110,7 @@ jobs:
               $url = $Matches[0]
               break
             }
+            if ($i % 5 -eq 0) { Write-Host "waiting for tunnel... $i" }
           }
 
           if (-not $url) {
@@ -118,29 +120,24 @@ jobs:
 
           "TUNNEL_URL=$url" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tunnel is up: $url"
-
-      - name: Print browser link
-        shell: pwsh
-        run: |
           Write-Host ""
           Write-Host "=========================================="
           Write-Host " BROWSER LINK"
           Write-Host "=========================================="
-          Write-Host "$env:TUNNEL_URL/vnc.html?autoconnect=true&password=vncpass"
+          Write-Host "$url/vnc.html?autoconnect=true&password=vncpass"
           Write-Host "VNC password : vncpass"
           Write-Host "Windows user : RDP"
           Write-Host "Windows pass : $env:RDP_PASS"
           Write-Host "=========================================="
+          Write-Host ""
 
-      - name: Keep alive
-        shell: pwsh
-        run: |
-          $end = (Get-Date).AddMinutes(170)
-          while ((Get-Date) -lt $end) {
-            Start-Sleep 30
-            if (-not (Get-Process cloudflared -ErrorAction SilentlyContinue)) {
-              Write-Host "cloudflared died, stopping"
-              exit 1
+          # Keep the tunnel alive forever (auto-restart on death)
+          while ($true) {
+            if ($proc.HasExited) {
+              Write-Host "cloudflared died – restarting..."
+              $proc = Start-Tunnel
+              Start-Sleep 10
             }
+            Write-Host "[$(Get-Date -Format o)] alive → $url"
+            Start-Sleep 90
           }
-          Write-Host "Time limit reached, shutting down"
