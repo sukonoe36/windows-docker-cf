@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Start simple HTTP server on 8080
+      - name: Start HTTP server on 8080
         run: |
           $code = @'
           $listener = New-Object System.Net.HttpListener
@@ -23,7 +23,7 @@ jobs:
           while ($listener.IsListening) {
             $ctx = $listener.GetContext()
             $res = $ctx.Response
-            $html = "<h1>Windows runner is up</h1><p>GitHub Actions + Cloudflare Tunnel</p>"
+            $html = "<h1>Windows runner alive</h1><p>GitHub Actions + Cloudflare</p>"
             $buf = [System.Text.Encoding]::UTF8.GetBytes($html)
             $res.ContentLength64 = $buf.Length
             $res.ContentType = "text/html"
@@ -32,55 +32,73 @@ jobs:
           }
           '@
           Start-Process powershell -ArgumentList "-Command", $code -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          Start-Sleep -Seconds 4
 
       - name: Install cloudflared
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile cloudflared.exe
+          .\cloudflared.exe --version
 
-      - name: Start Cloudflare tunnel
+      - name: Start tunnel + extract URL
         run: |
-          Start-Process -FilePath ".\cloudflared.exe" `
+          # Clear old logs
+          Remove-Item cf.out, cf.err -ErrorAction SilentlyContinue
+
+          # Start cloudflared, capture both stdout and stderr
+          $p = Start-Process -FilePath ".\cloudflared.exe" `
             -ArgumentList "tunnel --no-autoupdate --url http://localhost:8080" `
-            -RedirectStandardOutput "cf.log" `
+            -RedirectStandardOutput "cf.out" `
             -RedirectStandardError "cf.err" `
-            -NoNewWindow
+            -PassThru -NoNewWindow
 
           $url = $null
-          for ($i = 1; $i -le 40; $i++) {
+          for ($i = 1; $i -le 60; $i++) {
             Start-Sleep -Seconds 2
-            if (Test-Path cf.log) {
-              $txt = Get-Content cf.log -Raw -ErrorAction SilentlyContinue
-              if ($txt -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
-                $url = $Matches[0]
-                break
-              }
+
+            $out = ""
+            $err = ""
+            if (Test-Path cf.out) { $out = Get-Content cf.out -Raw -ErrorAction SilentlyContinue }
+            if (Test-Path cf.err) { $err = Get-Content cf.err -Raw -ErrorAction SilentlyContinue }
+
+            $combined = "$out`n$err"
+
+            if ($combined -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+              $url = $Matches[0]
+              break
             }
-            Write-Host "waiting for tunnel... $i"
+
+            # Progress every 10 seconds
+            if ($i % 5 -eq 0) {
+              Write-Host "still waiting for tunnel... ($i/60)"
+              if ($combined) { Write-Host $combined.Substring(0, [Math]::Min(300, $combined.Length)) }
+            }
           }
 
           if (-not $url) {
-            Get-Content cf.log -ErrorAction SilentlyContinue
+            Write-Host "===== cf.out ====="
+            Get-Content cf.out -ErrorAction SilentlyContinue
+            Write-Host "===== cf.err ====="
             Get-Content cf.err -ErrorAction SilentlyContinue
-            Write-Error "No tunnel URL"
+            Write-Error "Could not detect trycloudflare URL"
             exit 1
           }
 
           echo "TUNNEL_URL=$url" >> $env:GITHUB_ENV
-          Write-Host "Tunnel ready: $url"
+          Write-Host "Tunnel URL found: $url"
 
-      - name: Print URL
+      - name: Print public link
         run: |
           Write-Host ""
           Write-Host "========================================"
-          Write-Host " OPEN THIS"
+          Write-Host " OPEN THIS LINK"
           Write-Host "========================================"
           Write-Host $env:TUNNEL_URL
           Write-Host "========================================"
+          Write-Host ""
 
       - name: Keep alive
         run: |
           while ($true) {
             Start-Sleep -Seconds 300
-            Write-Host "[$(Get-Date -Format o)] still up → $env:TUNNEL_URL"
+            Write-Host "[$(Get-Date -Format o)] still alive → $env:TUNNEL_URL"
           }
