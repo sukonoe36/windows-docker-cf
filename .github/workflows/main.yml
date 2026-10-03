@@ -1,5 +1,5 @@
-# .github/workflows/windows-docker-cf.yml
-name: Windows Docker + Cloudflare
+# .github/workflows/windows-cf.yml
+name: Windows + Cloudflare
 
 on:
   workflow_dispatch:
@@ -8,96 +8,79 @@ permissions:
   contents: read
 
 jobs:
-  win-docker-tunnel:
+  tunnel:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 90
 
     steps:
-      - name: Check Docker
+      - name: Start simple HTTP server on 8080
         run: |
-          docker version
-          docker info
-
-      - name: Pull Windows Server Core
-        run: docker pull mcr.microsoft.com/windows/servercore:ltsc2022
-
-      - name: Start Windows container (HTTP on 8080)
-        run: |
-          docker run -d --name win-http -p 8080:8080 `
-            mcr.microsoft.com/windows/servercore:ltsc2022 `
-            powershell -Command "
-              `$listener = New-Object System.Net.HttpListener;
-              `$listener.Prefixes.Add('http://+:8080/');
-              `$listener.Start();
-              Write-Host 'Windows container listening on 8080';
-              while (`$listener.IsListening) {
-                `$ctx = `$listener.GetContext();
-                `$res = `$ctx.Response;
-                `$html = '<h1>Windows Docker container is alive</h1><p>From GitHub Actions + Cloudflare Tunnel</p>';
-                `$buf = [System.Text.Encoding]::UTF8.GetBytes(`$html);
-                `$res.ContentLength64 = `$buf.Length;
-                `$res.ContentType = 'text/html';
-                `$res.OutputStream.Write(`$buf, 0, `$buf.Length);
-                `$res.Close();
-              }
-            "
-
-      - name: Wait for container
-        run: Start-Sleep -Seconds 8
+          $code = @'
+          $listener = New-Object System.Net.HttpListener
+          $listener.Prefixes.Add("http://+:8080/")
+          $listener.Start()
+          Write-Host "Listening on 8080"
+          while ($listener.IsListening) {
+            $ctx = $listener.GetContext()
+            $res = $ctx.Response
+            $html = "<h1>Windows runner is up</h1><p>GitHub Actions + Cloudflare Tunnel</p>"
+            $buf = [System.Text.Encoding]::UTF8.GetBytes($html)
+            $res.ContentLength64 = $buf.Length
+            $res.ContentType = "text/html"
+            $res.OutputStream.Write($buf, 0, $buf.Length)
+            $res.Close()
+          }
+          '@
+          Start-Process powershell -ArgumentList "-Command", $code -WindowStyle Hidden
+          Start-Sleep -Seconds 3
 
       - name: Install cloudflared
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile cloudflared.exe
 
-      - name: Start Cloudflare quick tunnel
+      - name: Start Cloudflare tunnel
         run: |
-          Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --no-autoupdate --url http://localhost:8080" -RedirectStandardOutput "cloudflared.log" -RedirectStandardError "cloudflared.err" -NoNewWindow
+          Start-Process -FilePath ".\cloudflared.exe" `
+            -ArgumentList "tunnel --no-autoupdate --url http://localhost:8080" `
+            -RedirectStandardOutput "cf.log" `
+            -RedirectStandardError "cf.err" `
+            -NoNewWindow
 
           $url = $null
-          for ($i = 1; $i -le 30; $i++) {
+          for ($i = 1; $i -le 40; $i++) {
             Start-Sleep -Seconds 2
-            if (Test-Path cloudflared.log) {
-              $content = Get-Content cloudflared.log -Raw
-              if ($content -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+            if (Test-Path cf.log) {
+              $txt = Get-Content cf.log -Raw -ErrorAction SilentlyContinue
+              if ($txt -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
                 $url = $Matches[0]
                 break
               }
             }
-            Write-Host "Waiting for tunnel URL... ($i)"
+            Write-Host "waiting for tunnel... $i"
           }
 
           if (-not $url) {
-            Write-Host "=== cloudflared.log ==="
-            Get-Content cloudflared.log -ErrorAction SilentlyContinue
-            Write-Host "=== cloudflared.err ==="
-            Get-Content cloudflared.err -ErrorAction SilentlyContinue
-            Write-Error "Failed to get Cloudflare tunnel URL"
+            Get-Content cf.log -ErrorAction SilentlyContinue
+            Get-Content cf.err -ErrorAction SilentlyContinue
+            Write-Error "No tunnel URL"
             exit 1
           }
 
           echo "TUNNEL_URL=$url" >> $env:GITHUB_ENV
-          Write-Host "Tunnel is up: $url"
+          Write-Host "Tunnel ready: $url"
 
-      - name: Show public URL
+      - name: Print URL
         run: |
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host " OPEN THIS LINK"
-          Write-Host "=========================================="
+          Write-Host "========================================"
+          Write-Host " OPEN THIS"
+          Write-Host "========================================"
           Write-Host $env:TUNNEL_URL
-          Write-Host "=========================================="
-          Write-Host ""
+          Write-Host "========================================"
 
       - name: Keep alive
         run: |
-          Write-Host "Tunnel live. Keeping job alive..."
           while ($true) {
             Start-Sleep -Seconds 300
-            Write-Host "[$(Get-Date -Format o)] still alive → $env:TUNNEL_URL"
+            Write-Host "[$(Get-Date -Format o)] still up → $env:TUNNEL_URL"
           }
-
-      - name: Cleanup
-        if: always()
-        run: |
-          docker stop win-http -ErrorAction SilentlyContinue
-          docker rm win-http -ErrorAction SilentlyContinue
