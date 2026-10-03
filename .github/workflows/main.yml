@@ -15,6 +15,7 @@ jobs:
 
     steps:
       - name: Enable RDP + create user
+        shell: pwsh
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
@@ -22,7 +23,6 @@ jobs:
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service TermService -Force
 
-          # Strong password that always passes policy
           $pass = "Rdp@" + (Get-Random -Minimum 10000000 -Maximum 99999999) + "xX!"
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
 
@@ -35,15 +35,22 @@ jobs:
           Write-Host "RDP user ready — password: $pass"
 
       - name: Install TightVNC
+        shell: pwsh
         run: |
-          Invoke-WebRequest "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi" -OutFile tvn.msi
-          Start-Process msiexec -ArgumentList "/i tvn.msi /quiet /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=vncpass" -Wait
-          Start-Sleep 2
+          $msi = Join-Path $env:TEMP "tightvnc.msi"
+          Invoke-WebRequest "https://www.tightvnc.com/download/2.8.81/tightvnc-2.8.81-gpl-setup-64bit.msi" -OutFile $msi
+          Start-Process msiexec.exe -Wait -ArgumentList "/i `"$msi`" /qn /norestart ADDLOCAL=Server SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=vncpass"
+
+          if (-not (Test-Path "C:\Program Files\TightVNC\tvnserver.exe")) {
+            throw "TightVNC installation failed"
+          }
+
           & "C:\Program Files\TightVNC\tvnserver.exe" -start
           Start-Sleep 3
           Write-Host "TightVNC installed and started"
 
       - name: Enable TightVNC loopback + restart
+        shell: pwsh
         run: |
           $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
           if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
@@ -57,67 +64,63 @@ jobs:
           Write-Host "Loopback enabled and VNC restarted"
 
       - name: Install noVNC + websockify
+        shell: pwsh
         run: |
           pip install websockify --quiet
-          git clone --depth 1 https://github.com/novnc/noVNC.git $env:USERPROFILE\noVNC
+          if (-not (Test-Path "$env:USERPROFILE\noVNC")) {
+            git clone --depth 1 https://github.com/novnc/noVNC.git "$env:USERPROFILE\noVNC"
+          }
           Write-Host "noVNC ready"
 
       - name: Start websockify
+        shell: pwsh
         run: |
-          Start-Process powershell -ArgumentList "-WindowStyle Hidden -Command websockify --web $env:USERPROFILE\noVNC 6080 localhost:5900" -WindowStyle Hidden
+          Start-Process -FilePath "websockify.exe" -ArgumentList @("--web", "$env:USERPROFILE\noVNC", "6080", "localhost:5900") -PassThru -NoNewWindow
           Start-Sleep 4
           Write-Host "websockify on 6080"
 
       - name: Install cloudflared
+        shell: pwsh
         run: |
-          Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile cloudflared.exe
-          .\cloudflared.exe --version
+          $exe = Join-Path $env:RUNNER_TEMP "cloudflared.exe"
+          Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $exe
+          & $exe --version
 
-      - name: Start and maintain Cloudflare tunnel
+      - name: Start Cloudflare tunnel
+        shell: pwsh
         run: |
-          function Start-Tunnel {
-            Remove-Item cf.out, cf.err -EA SilentlyContinue
-            $p = Start-Process -FilePath .\cloudflared.exe `
-              -ArgumentList "tunnel --no-autoupdate --url http://localhost:6080" `
-              -RedirectStandardOutput cf.out -RedirectStandardError cf.err `
-              -PassThru -NoNewWindow
-            return $p
-          }
+          $exe = Join-Path $env:RUNNER_TEMP "cloudflared.exe"
+          $out = Join-Path $env:RUNNER_TEMP "cf.out"
+          $err = Join-Path $env:RUNNER_TEMP "cf.err"
 
-          $proc = Start-Tunnel
+          Remove-Item $out, $err -ErrorAction SilentlyContinue
+
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList "tunnel --no-autoupdate --url http://localhost:6080" `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -PassThru -NoNewWindow
+
           $url = $null
-
-          for ($i = 1; $i -le 50; $i++) {
+          for ($i = 1; $i -le 60; $i++) {
             Start-Sleep 2
-            $log = (Get-Content cf.out, cf.err -Raw -EA SilentlyContinue) -join "`n"
+            $log = (Get-Content $out, $err -Raw -ErrorAction SilentlyContinue) -join "`n"
             if ($log -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
               $url = $Matches[0]
               break
             }
-            if ($i % 5 -eq 0) { Write-Host "waiting for tunnel... $i" }
           }
 
           if (-not $url) {
-            Get-Content cf.out, cf.err -EA SilentlyContinue
-            Write-Error "Failed to get tunnel URL"
-            exit 1
+            Get-Content $out, $err -ErrorAction SilentlyContinue
+            throw "Failed to get tunnel URL"
           }
 
           "TUNNEL_URL=$url" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tunnel is up: $url"
 
-          # Keep alive + auto-restart if cloudflared dies
-          while ($true) {
-            if ($proc.HasExited) {
-              Write-Host "cloudflared died – restarting..."
-              $proc = Start-Tunnel
-              Start-Sleep 8
-            }
-            Write-Host "[$(Get-Date -Format o)] alive → $url"
-            Start-Sleep 120
-          }
-
       - name: Print browser link
+        shell: pwsh
         run: |
           Write-Host ""
           Write-Host "=========================================="
