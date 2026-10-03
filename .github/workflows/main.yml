@@ -38,7 +38,20 @@ jobs:
           Start-Sleep 2
           & "C:\Program Files\TightVNC\tvnserver.exe" -start
           Start-Sleep 3
-          Write-Host "TightVNC running"
+          Write-Host "TightVNC installed and started"
+
+      - name: Enable TightVNC loopback + restart
+        run: |
+          $regPath = "HKLM:\SOFTWARE\TightVNC\Server"
+          if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+          Set-ItemProperty -Path $regPath -Name "AllowLoopback" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $regPath -Name "LoopbackOnly" -Value 0 -Type DWord -Force
+
+          & "C:\Program Files\TightVNC\tvnserver.exe" -stop
+          Start-Sleep 2
+          & "C:\Program Files\TightVNC\tvnserver.exe" -start
+          Start-Sleep 3
+          Write-Host "Loopback enabled and VNC restarted"
 
       - name: Install noVNC + websockify
         run: |
@@ -71,7 +84,6 @@ jobs:
           $proc = Start-Tunnel
           $url = $null
 
-          # Wait for first URL
           for ($i = 1; $i -le 50; $i++) {
             Start-Sleep 2
             $log = (Get-Content cf.out, cf.err -Raw -EA SilentlyContinue) -join "`n"
@@ -91,7 +103,7 @@ jobs:
           "TUNNEL_URL=$url" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "Tunnel is up: $url"
 
-          # Keep the tunnel alive and restart if it dies
+          # Keep alive + auto-restart if cloudflared dies
           while ($true) {
             if ($proc.HasExited) {
               Write-Host "cloudflared died – restarting..."
@@ -102,9 +114,8 @@ jobs:
             Start-Sleep 120
           }
 
-      - name: Print link (this runs in parallel conceptually but we print early)
+      - name: Print browser link
         run: |
-          # This step is just for visibility; the real keep-alive is above
           Write-Host ""
           Write-Host "=========================================="
           Write-Host " BROWSER LINK"
