@@ -23,7 +23,7 @@ jobs:
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Restart-Service TermService -Force
 
-          $pass = "Rdp@" + (Get-Random -Minimum 10000000 -Maximum 99999999) + "xX!"
+          $pass = "Kx9@" + (Get-Random -Minimum 10000000 -Maximum 99999999) + "zQ!"
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
 
           if (Get-LocalUser RDP -EA SilentlyContinue) { Remove-LocalUser RDP }
