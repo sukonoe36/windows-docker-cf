@@ -131,3 +131,16 @@ jobs:
           Write-Host "Windows user : RDP"
           Write-Host "Windows pass : $env:RDP_PASS"
           Write-Host "=========================================="
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          $end = (Get-Date).AddMinutes(170)
+          while ((Get-Date) -lt $end) {
+            Start-Sleep 30
+            if (-not (Get-Process cloudflared -ErrorAction SilentlyContinue)) {
+              Write-Host "cloudflared died, stopping"
+              exit 1
+            }
+          }
+          Write-Host "Time limit reached, shutting down"
