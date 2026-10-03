@@ -1,77 +1,166 @@
-# .github/workflows/windows-cf.yml
-name: Windows + Cloudflare
+# .github/workflows/rdp-cloudflare.yml
+name: RDP-Cloudflare
+run-name: "RDP-CF #${{ github.run_number }} — ${{ github.event.inputs.deadline == '' && 'new session' || 'auto-continue' }}"
 
 on:
   workflow_dispatch:
+    inputs:
+      deadline:
+        description: "Leave empty. Used by auto-restart to keep the 24h deadline"
+        required: false
+        default: ""
 
 permissions:
+  actions: write
   contents: read
 
 jobs:
-  tunnel:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 360
 
     steps:
-      - name: Start HTTP server on 8080
+      - name: Set 24h Deadline
         run: |
-          $code = @'
-          $listener = New-Object System.Net.HttpListener
-          $listener.Prefixes.Add("http://+:8080/")
-          $listener.Start()
-          Write-Host "Listening on 8080"
-          while ($listener.IsListening) {
-            $ctx = $listener.GetContext()
-            $res = $ctx.Response
-            $html = "<h1>Windows runner alive</h1><p>GitHub Actions + Cloudflare</p>"
-            $buf = [System.Text.Encoding]::UTF8.GetBytes($html)
-            $res.ContentLength64 = $buf.Length
-            $res.ContentType = "text/html"
-            $res.OutputStream.Write($buf, 0, $buf.Length)
-            $res.Close()
+          $deadline = "${{ github.event.inputs.deadline }}"
+          if ([string]::IsNullOrWhiteSpace($deadline)) {
+            $deadline = [DateTimeOffset]::UtcNow.AddHours(24).ToUnixTimeSeconds()
           }
-          '@
-          Start-Process powershell -ArgumentList "-Command", $code -WindowStyle Hidden
-          Start-Sleep -Seconds 4
+          "DEADLINE=$deadline" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $endTime = [DateTimeOffset]::FromUnixTimeSeconds([long]$deadline).UtcDateTime
+          Write-Host "Session deadline: $endTime UTC"
+
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Cloudflare" 2>$null
+          netsh advfirewall firewall add rule name="RDP-Cloudflare" dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured."
+
+      - name: Lighten Windows
+        run: |
+          try { powercfg /setactive SCHEME_MIN } catch {}
+          try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
+
+          $services = @("WSearch","wuauserv","UsoSvc","SysMain","DiagTrack","DoSvc","MapsBroker")
+          foreach ($svc in $services) {
+            try {
+              Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+              Set-Service -Name $svc -StartupType Manual -ErrorAction SilentlyContinue
+            } catch {}
+          }
+
+          try {
+            $ts = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+            if (-not (Test-Path $ts)) { New-Item -Path $ts -Force | Out-Null }
+            Set-ItemProperty -Path $ts -Name "fNoRemoteDesktopWallpaper" -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $ts -Name "ColorDepth" -Value 4 -Type DWord -Force
+          } catch {}
+
+          try {
+            reg load HKU\DefUser C:\Users\Default\NTUSER.DAT
+            reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+            reg add "HKU\DefUser\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+            reg add "HKU\DefUser\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f
+            reg add "HKU\DefUser\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+            reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f
+            reg add "HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+            [gc]::Collect()
+            Start-Sleep -Seconds 2
+            reg unload HKU\DefUser
+          } catch {}
+
+          try {
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" /v VisualFXSetting /t REG_DWORD /d 2 /f
+            reg add "HKCU\Control Panel\Desktop" /v UserPreferencesMask /t REG_BINARY /d 9012038010000000 /f
+            reg add "HKCU\Control Panel\Desktop" /v DragFullWindows /t REG_SZ /d 0 /f
+            reg add "HKCU\Control Panel\Desktop\WindowMetrics" /v MinAnimate /t REG_SZ /d 0 /f
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" /v EnableTransparency /t REG_DWORD /d 0 /f
+            reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" /v TaskbarAnimations /t REG_DWORD /d 0 /f
+          } catch {}
+          Write-Host "Windows lightened."
+
+      - name: Disable Recurring Maintenance Tasks
+        run: |
+          $tasks = @(
+            "\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Verification",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Cache Maintenance",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Cleanup",
+            "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan",
+            "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan Static Task",
+            "\Microsoft\Windows\TaskScheduler\Maintenance Configurator",
+            "\Microsoft\Windows\Maintenance\WinSAT"
+          )
+          foreach ($t in $tasks) {
+            try {
+              Disable-ScheduledTask -TaskName ($t.Split('\')[-1]) -TaskPath ($t.Substring(0, $t.LastIndexOf('\') + 1)) -ErrorAction SilentlyContinue | Out-Null
+            } catch {}
+          }
+          Write-Host "Maintenance tasks disabled."
+
+      - name: Create RDP User
+        run: |
+          $charSet = @{
+            Upper   = [char[]](65..90)
+            Lower   = [char[]](97..122)
+            Number  = [char[]](48..57)
+            Special = [char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)
+          }
+          $raw = @()
+          $raw += $charSet.Upper   | Get-Random -Count 4
+          $raw += $charSet.Lower   | Get-Random -Count 4
+          $raw += $charSet.Number  | Get-Random -Count 4
+          $raw += $charSet.Special | Get-Random -Count 4
+          $password = -join ($raw | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
+          }
+
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          "RDP_USER=RDP"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "RDP user created."
 
       - name: Install cloudflared
         run: |
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile cloudflared.exe
           .\cloudflared.exe --version
 
-      - name: Start tunnel + extract URL
+      - name: Start Cloudflare TCP tunnel for RDP
         run: |
-          # Clear old logs
           Remove-Item cf.out, cf.err -ErrorAction SilentlyContinue
 
-          # Start cloudflared, capture both stdout and stderr
           $p = Start-Process -FilePath ".\cloudflared.exe" `
-            -ArgumentList "tunnel --no-autoupdate --url http://localhost:8080" `
+            -ArgumentList "tunnel --no-autoupdate --url tcp://localhost:3389" `
             -RedirectStandardOutput "cf.out" `
             -RedirectStandardError "cf.err" `
             -PassThru -NoNewWindow
 
           $url = $null
-          for ($i = 1; $i -le 60; $i++) {
+          for ($i = 1; $i -le 45; $i++) {
             Start-Sleep -Seconds 2
-
-            $out = ""
-            $err = ""
-            if (Test-Path cf.out) { $out = Get-Content cf.out -Raw -ErrorAction SilentlyContinue }
-            if (Test-Path cf.err) { $err = Get-Content cf.err -Raw -ErrorAction SilentlyContinue }
-
+            $out = if (Test-Path cf.out) { Get-Content cf.out -Raw -ErrorAction SilentlyContinue } else { "" }
+            $err = if (Test-Path cf.err) { Get-Content cf.err -Raw -ErrorAction SilentlyContinue } else { "" }
             $combined = "$out`n$err"
 
             if ($combined -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
               $url = $Matches[0]
               break
             }
-
-            # Progress every 10 seconds
-            if ($i % 5 -eq 0) {
-              Write-Host "still waiting for tunnel... ($i/60)"
-              if ($combined) { Write-Host $combined.Substring(0, [Math]::Min(300, $combined.Length)) }
-            }
+            if ($i % 5 -eq 0) { Write-Host "waiting for tunnel... $i" }
           }
 
           if (-not $url) {
@@ -79,26 +168,62 @@ jobs:
             Get-Content cf.out -ErrorAction SilentlyContinue
             Write-Host "===== cf.err ====="
             Get-Content cf.err -ErrorAction SilentlyContinue
-            Write-Error "Could not detect trycloudflare URL"
+            Write-Error "Failed to get Cloudflare tunnel URL"
             exit 1
           }
 
-          echo "TUNNEL_URL=$url" >> $env:GITHUB_ENV
-          Write-Host "Tunnel URL found: $url"
+          "TUNNEL_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Tunnel ready: $url"
 
-      - name: Print public link
+      - name: Show Access Information
         run: |
           Write-Host ""
-          Write-Host "========================================"
-          Write-Host " OPEN THIS LINK"
-          Write-Host "========================================"
-          Write-Host $env:TUNNEL_URL
-          Write-Host "========================================"
+          Write-Host "=========================================="
+          Write-Host " RDP via Cloudflare Tunnel"
+          Write-Host "=========================================="
+          Write-Host "Tunnel URL : $env:TUNNEL_URL"
+          Write-Host "Username   : $env:RDP_USER"
+          Write-Host "Password   : $env:RDP_PASS"
           Write-Host ""
+          Write-Host "How to connect from your PC:"
+          Write-Host "1. Install cloudflared on your machine"
+          Write-Host "2. Run this command:"
+          Write-Host "   cloudflared access tcp --hostname $env:TUNNEL_URL --url localhost:3389"
+          Write-Host "3. Open Remote Desktop and connect to: localhost:3389"
+          Write-Host "   User: $env:RDP_USER"
+          Write-Host "   Pass: $env:RDP_PASS"
+          Write-Host "=========================================="
 
-      - name: Keep alive
+      - name: Maintain Connection
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          while ($true) {
+          $deadline = [long]$env:DEADLINE
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          $handoverAt = $now + (310 * 60)
+          $endAt      = $now + (335 * 60)
+
+          while (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $handoverAt) -and
+                 ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $deadline)) {
+            try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
+            Write-Host "[$(Get-Date)] RDP Active → $env:TUNNEL_URL"
             Start-Sleep -Seconds 300
-            Write-Host "[$(Get-Date -Format o)] still alive → $env:TUNNEL_URL"
+          }
+
+          $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          if ($now -ge ($deadline - 600)) {
+            Write-Host "24h deadline reached. Stopping."
+            exit 0
+          }
+
+          Write-Host "Starting next runner..."
+          gh workflow run rdp-cloudflare.yml `
+            --repo ${{ github.repository }} `
+            --ref ${{ github.ref_name }} `
+            -f deadline=$deadline
+
+          while (([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $endAt) -and
+                 ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt $deadline)) {
+            Write-Host "[$(Get-Date)] Handover in progress"
+            Start-Sleep -Seconds 60
           }
